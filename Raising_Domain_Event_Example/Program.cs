@@ -9,6 +9,7 @@ builder.Services.AddDbContext<AppDbContext>(options => options.UseInMemoryDataba
 builder.Services.AddMediatR(typeof(CreateAccountUseCase));
 builder.Services.AddScoped<IAccountRepository, AccountRepository>();
 builder.Services.AddScoped<IUnitOfWork, UnitOfWorkEF>();
+// builder.Services.AddScoped<IDomainEventListener<IDomainEvent>, EmitIntegrationEventAccountCreatedEventListener>();
 
 var app = builder.Build();
 app.UseSwagger();
@@ -33,6 +34,7 @@ record CreateAccountOutput(Guid Id);
 interface ICreateAccountUseCase : IRequestHandler<CreateAccountInput, CreateAccountOutput> { };
 interface IAccountRepository { Task Insert(Account account); }
 interface IUnitOfWork { Task Commit(); }
+interface IDomainEventListener<T> where T : IDomainEvent { Task HandleEvent(T domainEvent); }
 
 // use cases
 class CreateAccountUseCase : ICreateAccountUseCase
@@ -59,6 +61,46 @@ class CreateAccountUseCase : ICreateAccountUseCase
     }
 }
 
+// domain event listenners
+class EmitIntegrationEventAccountCreatedEventListener : IDomainEventListener<AccountCreatedEvent>
+{
+    private readonly ILogger<EmitIntegrationEventAccountCreatedEventListener> _logger;
+
+    public EmitIntegrationEventAccountCreatedEventListener(ILogger<EmitIntegrationEventAccountCreatedEventListener> logger) => _logger = logger;
+
+    public Task HandleEvent(AccountCreatedEvent domainEvent)
+    {
+        _logger.LogInformation("Account created event handled for {email}", domainEvent.Email);
+        return Task.CompletedTask;
+    }
+}
+
+class OtherAccountCreatedEventListener : IDomainEventListener<AccountCreatedEvent>
+{
+    private readonly ILogger<OtherAccountCreatedEventListener> _logger;
+
+    public OtherAccountCreatedEventListener(ILogger<OtherAccountCreatedEventListener> logger) => _logger = logger;
+
+    public Task HandleEvent(AccountCreatedEvent domainEvent)
+    {
+        _logger.LogInformation("OTHER: Account created event handled for {email}", domainEvent.Email);
+        return Task.CompletedTask;
+    }
+}
+
+class OtherAccountSuspendedEventListener : IDomainEventListener<AccountSuspendedEvent>
+{
+    private readonly ILogger<OtherAccountSuspendedEventListener> _logger;
+
+    public OtherAccountSuspendedEventListener(ILogger<OtherAccountSuspendedEventListener> logger) => _logger = logger;
+
+    public Task HandleEvent(AccountSuspendedEvent domainEvent)
+    {
+        _logger.LogInformation("Suspendend... This listenners isn`t expected t run", domainEvent.Email);
+        return Task.CompletedTask;
+    }
+}
+
 // entities / domain
 interface IDomainEvent { }
 
@@ -80,6 +122,7 @@ abstract class Aggregate
 }
 
 record AccountCreatedEvent(Guid Id, string Name, string Email) : IDomainEvent;
+record AccountSuspendedEvent(Guid Id, string Name, string Email) : IDomainEvent;
 
 class Account : Aggregate
 {
@@ -113,11 +156,13 @@ class UnitOfWorkEF : IUnitOfWork
 {
     private readonly AppDbContext _context;
     private readonly ILogger<UnitOfWorkEF> _logger;
+    private readonly IEnumerable<IDomainEventListener<IDomainEvent>> _domainEventListeners;
 
-    public UnitOfWorkEF(AppDbContext context, ILogger<UnitOfWorkEF> logger)
+    public UnitOfWorkEF(AppDbContext context, ILogger<UnitOfWorkEF> logger, IEnumerable<IDomainEventListener<IDomainEvent>> domainEventListeners)
     {
-        _logger = logger;
         _context = context;
+        _logger = logger;
+        _domainEventListeners = domainEventListeners;
     }
 
     public Task Commit()
@@ -137,6 +182,8 @@ class UnitOfWorkEF : IUnitOfWork
             .SelectMany(x => x.Entity.Events)
             .ToList();
         _logger.LogInformation("Commit: {number} domain events raised", domainEvents.Count());
+
+        _logger.LogInformation("{nmumber} listeners", _domainEventListeners.Count());
 
         modifiedAggregatesChangeTrackers.ToList().ForEach(aggregates => aggregates.Entity.ClearEvents());
     }
