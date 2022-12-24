@@ -1,13 +1,14 @@
+using MediatR;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-builder.Services.AddScoped<ICreateAccountUseCase, CreateAccountUseCase>();
+builder.Services.AddDbContext<AppDbContext>(options => options.UseInMemoryDatabase("PocApp"));
+builder.Services.AddMediatR(typeof(CreateAccountUseCase));
 builder.Services.AddScoped<IAccountRepository, AccountRepository>();
 builder.Services.AddScoped<IUnitOfWork, UnitOfWorkEF>();
-builder.Services.AddDbContext<AppDbContext>(options => options.UseInMemoryDatabase("PocApp"));
 
 var app = builder.Build();
 app.UseSwagger();
@@ -15,7 +16,7 @@ app.UseSwaggerUI();
 app.UseHttpsRedirection();
 
 app.MapPost("/accounts", 
-    async ([FromBody] CreateAccountInput input, ICreateAccountUseCase useCase) => await useCase.Execute(input))
+    async ([FromBody] CreateAccountInput input, IMediator mediator) => await mediator.Send(input))
     .WithOpenApi();
 
 app.MapGet("/accounts", 
@@ -25,11 +26,11 @@ app.MapGet("/accounts",
 app.Run();
 
 // DTOs / use case input/output
-record CreateAccountInput(string Name, string Email);
+record CreateAccountInput(string Name, string Email) : IRequest<CreateAccountOutput>;
 record CreateAccountOutput(Guid Id);
 
 // interfaces
-interface ICreateAccountUseCase { Task<CreateAccountOutput> Execute(CreateAccountInput input); }
+interface ICreateAccountUseCase : IRequestHandler<CreateAccountInput, CreateAccountOutput> { };
 interface IAccountRepository { Task Insert(Account account); }
 interface IUnitOfWork { Task Commit(); }
 
@@ -46,8 +47,8 @@ class CreateAccountUseCase : ICreateAccountUseCase
         _accountRepository = repository;
         _unitOfWork = unitOfWork;
     }
-
-    public async Task<CreateAccountOutput> Execute(CreateAccountInput input)
+    
+    public async Task<CreateAccountOutput> Handle(CreateAccountInput input, CancellationToken cancellationToken)
     {
         _logger.LogInformation("Creating account for {email}", input.Email);
         var account = new Account(input.Name, input.Email);
@@ -59,17 +60,38 @@ class CreateAccountUseCase : ICreateAccountUseCase
 }
 
 // entities / domain
-class Account
+interface IDomainEvent { }
+
+abstract class Aggregate
 {
-    public Guid Id { get; set; }
+    public Guid Id { get; internal set; }
+
+    private readonly List<IDomainEvent> _events;
+    public IReadOnlyCollection<IDomainEvent> Events => _events;
+
+    public Aggregate()
+    {
+        Id = Guid.NewGuid();
+        _events = new();
+    }
+
+    internal void RaiseEvent(IDomainEvent @event) => _events.Add(@event);
+    internal void ClearEvents() => _events.Clear();
+}
+
+record AccountCreatedEvent(Guid Id, string Name, string Email) : IDomainEvent;
+
+class Account : Aggregate
+{
     public string Name { get; set; }
     public string Email { get; set; }
 
-    public Account(string name, string email)
+    public Account(string name, string email) : base()
     {
-        Id = Guid.NewGuid();
         Name = name;
         Email = email;
+
+        RaiseEvent(new AccountCreatedEvent(Id, Name, Email));
     }
 }
 
@@ -81,16 +103,43 @@ class AppDbContext : DbContext
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
-        => modelBuilder.Entity<Account>(entity => entity.HasKey(e => e.Id));
+        => modelBuilder.Entity<Account>(entity => { 
+            entity.HasKey(e => e.Id);
+            entity.Ignore(e => e.Events);
+        });
 }
 
 class UnitOfWorkEF : IUnitOfWork
 {
     private readonly AppDbContext _context;
+    private readonly ILogger<UnitOfWorkEF> _logger;
 
-    public UnitOfWorkEF(AppDbContext context) => _context = context;
+    public UnitOfWorkEF(AppDbContext context, ILogger<UnitOfWorkEF> logger)
+    {
+        _logger = logger;
+        _context = context;
+    }
 
-    public Task Commit() => _context.SaveChangesAsync();
+    public Task Commit()
+    {
+        RaiseDomainEvents();
+        return _context.SaveChangesAsync();
+    }
+
+    private void RaiseDomainEvents()
+    {
+        var modifiedAggregatesChangeTrackers = _context.ChangeTracker
+            .Entries<Aggregate>()
+            .Where(x => x.Entity.Events != null && x.Entity.Events.Any());
+        _logger.LogInformation("Commit: {number} aggregates modifieds", modifiedAggregatesChangeTrackers.Count());
+        
+        var domainEvents = modifiedAggregatesChangeTrackers
+            .SelectMany(x => x.Entity.Events)
+            .ToList();
+        _logger.LogInformation("Commit: {number} domain events raised", domainEvents.Count());
+
+        modifiedAggregatesChangeTrackers.ToList().ForEach(aggregates => aggregates.Entity.ClearEvents());
+    }
 }
 
 class AccountRepository : IAccountRepository
