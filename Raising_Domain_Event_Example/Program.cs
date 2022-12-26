@@ -9,7 +9,10 @@ builder.Services.AddDbContext<AppDbContext>(options => options.UseInMemoryDataba
 builder.Services.AddMediatR(typeof(CreateAccountUseCase));
 builder.Services.AddScoped<IAccountRepository, AccountRepository>();
 builder.Services.AddScoped<IUnitOfWork, UnitOfWorkEF>();
-// builder.Services.AddScoped<IDomainEventListener<IDomainEvent>, EmitIntegrationEventAccountCreatedEventListener>();
+builder.Services.AddScoped<IDomainEventDispatcher, DomainEventDispatcher>();
+builder.Services.AddScoped<IDomainEventListener<AccountCreatedEvent>, SendEmailForAccountCreatedEventListener>();
+builder.Services.AddScoped<IDomainEventListener<AccountCreatedEvent>, CreateIntegrationEventCreatedEventListener>();
+builder.Services.AddScoped<IDomainEventListener<AccountSuspendedEvent>, OtherAccountSuspendedEventListener>();
 
 var app = builder.Build();
 app.UseSwagger();
@@ -25,6 +28,8 @@ app.MapGet("/accounts",
     .WithOpenApi();
 
 app.Run();
+
+#region use cases / application
 
 // DTOs / use case input/output
 record CreateAccountInput(string Name, string Email) : IRequest<CreateAccountOutput>;
@@ -61,29 +66,31 @@ class CreateAccountUseCase : ICreateAccountUseCase
     }
 }
 
-// domain event listenners
-class EmitIntegrationEventAccountCreatedEventListener : IDomainEventListener<AccountCreatedEvent>
+// domain event listeners
+class SendEmailForAccountCreatedEventListener : IDomainEventListener<AccountCreatedEvent>
 {
-    private readonly ILogger<EmitIntegrationEventAccountCreatedEventListener> _logger;
+    private readonly ILogger<SendEmailForAccountCreatedEventListener> _logger;
 
-    public EmitIntegrationEventAccountCreatedEventListener(ILogger<EmitIntegrationEventAccountCreatedEventListener> logger) => _logger = logger;
+    public SendEmailForAccountCreatedEventListener(ILogger<SendEmailForAccountCreatedEventListener> logger) => _logger = logger;
 
     public Task HandleEvent(AccountCreatedEvent domainEvent)
     {
-        _logger.LogInformation("Account created event handled for {email}", domainEvent.Email);
+        _logger.LogInformation("Account created event handled for {email} - sending email...", 
+            domainEvent.Email);
         return Task.CompletedTask;
     }
 }
 
-class OtherAccountCreatedEventListener : IDomainEventListener<AccountCreatedEvent>
+class CreateIntegrationEventCreatedEventListener : IDomainEventListener<AccountCreatedEvent>
 {
-    private readonly ILogger<OtherAccountCreatedEventListener> _logger;
+    private readonly ILogger<CreateIntegrationEventCreatedEventListener> _logger;
 
-    public OtherAccountCreatedEventListener(ILogger<OtherAccountCreatedEventListener> logger) => _logger = logger;
+    public CreateIntegrationEventCreatedEventListener(ILogger<CreateIntegrationEventCreatedEventListener> logger) => _logger = logger;
 
     public Task HandleEvent(AccountCreatedEvent domainEvent)
     {
-        _logger.LogInformation("OTHER: Account created event handled for {email}", domainEvent.Email);
+        _logger.LogInformation("Let`s communicate other microservices: Account created event handled for {email}", 
+            domainEvent.Email);
         return Task.CompletedTask;
     }
 }
@@ -100,6 +107,33 @@ class OtherAccountSuspendedEventListener : IDomainEventListener<AccountSuspended
         return Task.CompletedTask;
     }
 }
+
+interface IDomainEventDispatcher{ Task Dispatch<T>(T domainEvent) where T : IDomainEvent; }
+
+class DomainEventDispatcher : IDomainEventDispatcher
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<DomainEventDispatcher> _logger;
+
+    public DomainEventDispatcher(IServiceProvider serviceProvider, ILogger<DomainEventDispatcher> logger)
+    {
+        _serviceProvider = serviceProvider;
+        _logger = logger;
+    }
+
+    public async Task Dispatch<T>(T domainEvent) where T : IDomainEvent
+    {
+        var listeners = _serviceProvider.GetServices<IDomainEventListener<T>>();
+        _logger.LogInformation("Dispatching {eventName} - {number} listenners", domainEvent.GetType().Name, listeners.Count());
+
+        foreach(var listener in listeners)
+            await listener.HandleEvent(domainEvent);
+    }
+}
+
+#endregion
+
+#region entities/domain
 
 // entities / domain
 interface IDomainEvent { }
@@ -138,6 +172,10 @@ class Account : Aggregate
     }
 }
 
+#endregion
+
+#region gateways/infra
+
 // persistence
 class AppDbContext : DbContext
 {
@@ -155,23 +193,23 @@ class AppDbContext : DbContext
 class UnitOfWorkEF : IUnitOfWork
 {
     private readonly AppDbContext _context;
+    private readonly IDomainEventDispatcher _domainEventDispatcher;
     private readonly ILogger<UnitOfWorkEF> _logger;
-    private readonly IEnumerable<IDomainEventListener<IDomainEvent>> _domainEventListeners;
 
-    public UnitOfWorkEF(AppDbContext context, ILogger<UnitOfWorkEF> logger, IEnumerable<IDomainEventListener<IDomainEvent>> domainEventListeners)
+    public UnitOfWorkEF(AppDbContext context, IDomainEventDispatcher domainEventDispatcher, ILogger<UnitOfWorkEF> logger)
     {
         _context = context;
+        _domainEventDispatcher = domainEventDispatcher;
         _logger = logger;
-        _domainEventListeners = domainEventListeners;
     }
 
-    public Task Commit()
+    public async Task Commit()
     {
-        RaiseDomainEvents();
-        return _context.SaveChangesAsync();
+        await RaiseDomainEvents();
+        await _context.SaveChangesAsync();
     }
 
-    private void RaiseDomainEvents()
+    private async Task RaiseDomainEvents()
     {
         var modifiedAggregatesChangeTrackers = _context.ChangeTracker
             .Entries<Aggregate>()
@@ -183,8 +221,9 @@ class UnitOfWorkEF : IUnitOfWork
             .ToList();
         _logger.LogInformation("Commit: {number} domain events raised", domainEvents.Count());
 
-        _logger.LogInformation("{nmumber} listeners", _domainEventListeners.Count());
-
+        foreach(var @event in domainEvents)
+            await _domainEventDispatcher.Dispatch(@event);
+        
         modifiedAggregatesChangeTrackers.ToList().ForEach(aggregates => aggregates.Entity.ClearEvents());
     }
 }
@@ -197,3 +236,5 @@ class AccountRepository : IAccountRepository
 
     public async Task Insert(Account account) => await _context.Accounts.AddAsync(account);
 }
+
+#endregion
