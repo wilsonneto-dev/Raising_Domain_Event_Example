@@ -22,10 +22,7 @@
             _logger.LogWarning("No listener registered found for event {eventType}", eventType);
             return;
         }
-
-        // with reflections may be:
-        // var listeners = _serviceProvider.GetServices(typeof(IDomainEventListener<>).MakeGenericType(eventType));
-
+        
         var listenerType = _listenersTypes[eventType];
         var listeners = _serviceProvider.GetServices(listenerType);
         if(listeners.Count() == 0)
